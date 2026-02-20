@@ -8,6 +8,27 @@ from model import MultiTaskPropertyModel
 MODEL_PATH = "saved_model.pt"
 
 
+def _market_demand_probability(features: torch.Tensor) -> float:
+    area, bedrooms, bathrooms, distance, age = features[0].tolist()
+
+    area_n = max(0.0, min(area / 500.0, 1.0))
+    bed_n = max(0.0, min(bedrooms / 6.0, 1.0))
+    bath_n = max(0.0, min(bathrooms / 4.0, 1.0))
+    dist_n = max(0.0, min(1.0 - (distance / 30.0), 1.0))
+    age_n = max(0.0, min(1.0 - (age / 80.0), 1.0))
+
+    market_score = (
+        0.32 * area_n
+        + 0.24 * bed_n
+        + 0.20 * bath_n
+        + 0.16 * dist_n
+        + 0.12 * age_n
+        - 0.40
+    )
+    market_prob = torch.sigmoid(torch.tensor(5.0 * market_score)).item()
+    return float(market_prob)
+
+
 def _heuristic_prediction(features: torch.Tensor) -> tuple[float, float, float]:
     area, bedrooms, bathrooms, distance, age = features[0].tolist()
 
@@ -29,9 +50,32 @@ def _heuristic_prediction(features: torch.Tensor) -> tuple[float, float, float]:
     )
     rent_price = max(rent_price, 500)
 
-    demand_logit = 0.015 * area + 0.72 * bedrooms + 0.48 * bathrooms - 0.11 * distance - 0.045 * age
-    demand_prob = 1.0 / (1.0 + torch.exp(torch.tensor(-demand_logit))).item()
+    demand_prob = _market_demand_probability(features)
     return float(sale_price), float(rent_price), float(demand_prob)
+
+
+def _calibrate_demand_probability(features: torch.Tensor, base_prob: float) -> float:
+    """Apply domain calibration so extreme low-attractiveness properties map to low demand."""
+    area, bedrooms, bathrooms, distance, age = features[0].tolist()
+    demand_prob = float(base_prob)
+
+    # Hard low-demand rule requested: very small and very old homes should be low demand.
+    if area <= 55 and age >= 50:
+        demand_prob = min(demand_prob, 0.25)
+    elif area <= 70 and age >= 45:
+        demand_prob = min(demand_prob, 0.38)
+
+    # Soft adjustments for feature quality.
+    if bedrooms <= 1:
+        demand_prob -= 0.07
+    if bathrooms <= 1:
+        demand_prob -= 0.06
+    if distance >= 22:
+        demand_prob -= 0.08
+    if area >= 220 and age <= 20:
+        demand_prob += 0.06
+
+    return max(0.0, min(1.0, demand_prob))
 
 
 @st.cache_resource
@@ -54,7 +98,7 @@ def load_artifacts() -> tuple[MultiTaskPropertyModel, torch.Tensor, torch.Tensor
     return model.eval(), reg_mean, reg_std, False
 
 
-def predict_property(features: torch.Tensor) -> tuple[float, float, str, float]:
+def predict_property(features: torch.Tensor) -> tuple[float, float, str, str]:
     model, reg_mean, reg_std, has_trained = load_artifacts()
 
     if not has_trained:
@@ -67,8 +111,17 @@ def predict_property(features: torch.Tensor) -> tuple[float, float, str, float]:
             rent_price = max(float(reg_pred[0, 1].item()), 500.0)
             demand_prob = float(torch.sigmoid(cls_logit).item())
 
-    demand_label = "High Demand" if demand_prob >= 0.5 else "Low Demand"
-    return sale_price, rent_price, demand_label, demand_prob
+    demand_prob = _calibrate_demand_probability(features, demand_prob)
+
+    if demand_prob >= 0.7:
+        demand_label = "High Demand"
+    elif demand_prob <= 0.4:
+        demand_label = "Low Demand"
+    else:
+        demand_label = "Moderate Demand"
+
+    demand_probability = f"{demand_prob * 100:.0f}%"
+    return sale_price, rent_price, demand_label, demand_probability
 
 
 def _inject_styles() -> None:
@@ -285,6 +338,7 @@ def _inject_styles() -> None:
 
         .demand-high { background: linear-gradient(180deg, #35c37d, #2aaf70); }
         .demand-low { background: linear-gradient(180deg, #ef6868, #d95454); }
+        .demand-moderate { background: linear-gradient(180deg, #f3b24c, #e29b2d); }
 
         div[data-testid="stButton"] { margin-top: 14px; width: 100%; }
         div[data-testid="stButton"] > button {
@@ -362,8 +416,8 @@ def run_app() -> None:
         st.session_state.has_prediction = False
     if "demand_label" not in st.session_state:
         st.session_state.demand_label = "High Demand"
-    if "demand_prob" not in st.session_state:
-        st.session_state.demand_prob = 0.87
+    if "demand_probability" not in st.session_state:
+        st.session_state.demand_probability = "87%"
 
     st.markdown(
         """
@@ -434,6 +488,8 @@ def run_app() -> None:
                     and float(distance) == 0.0
                     and float(age) == 0.0
                 )
+                has_required_room_inputs = float(bedrooms) > 0.0 and float(bathrooms) > 0.0
+                can_predict = has_required_room_inputs and not all_features_zero
 
     with right:
         with st.container(border=True):
@@ -497,7 +553,11 @@ def run_app() -> None:
                         unsafe_allow_html=True,
                     )
 
-                badge_class = "demand-high" if st.session_state.demand_label == "High Demand" else "demand-low"
+                badge_class = "demand-moderate"
+                if st.session_state.demand_label == "High Demand":
+                    badge_class = "demand-high"
+                elif st.session_state.demand_label == "Low Demand":
+                    badge_class = "demand-low"
                 with st.container(border=True):
                     st.markdown('<div class="demand-box"></div>', unsafe_allow_html=True)
                     st.markdown(
@@ -505,9 +565,8 @@ def run_app() -> None:
                         <div class="demand-wrap">
                           <div>
                             <div class="demand-title">Demand Prediction</div>
-                            <div class="demand-prob">{st.session_state.demand_prob * 100:.0f}% confidence</div>
                           </div>
-                          <div class="demand-badge {badge_class}">{st.session_state.demand_label}</div>
+                          <div class="demand-badge {badge_class}">{st.session_state.demand_label} · {st.session_state.demand_probability}</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
@@ -517,10 +576,12 @@ def run_app() -> None:
                 "◎  Predict Property Value",
                 key="predict_button",
                 use_container_width=True,
-                disabled=all_features_zero,
+                disabled=not can_predict,
             )
 
-            if all_features_zero:
+            if not has_required_room_inputs:
+                st.caption("Choose both Bedrooms and Bathrooms (greater than 0) to enable prediction.")
+            elif all_features_zero:
                 st.caption("Set at least one Property Feature above 0 to enable prediction.")
 
             if predict_clicked:
@@ -528,12 +589,12 @@ def run_app() -> None:
                     [[float(area), float(bedrooms), float(bathrooms), float(distance), float(age)]],
                     dtype=torch.float32,
                 )
-                sale_price, rent_price, demand_label, demand_prob = predict_property(features)
+                sale_price, rent_price, demand_label, demand_probability = predict_property(features)
 
                 st.session_state.sale_price = sale_price
                 st.session_state.rent_price = rent_price
                 st.session_state.demand_label = demand_label
-                st.session_state.demand_prob = demand_prob
+                st.session_state.demand_probability = demand_probability
                 st.session_state.has_prediction = True
                 st.rerun()
 
