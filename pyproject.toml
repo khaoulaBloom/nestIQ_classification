@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nestiq-classification"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.42.0",
+    "torch>=2.2.0",
+]
+
+[tool.setuptools]
+py-modules = ["app", "data", "evaluate", "inference", "main", "model", "train"]
